@@ -1,6 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import lightgbm as lgb
+import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from pathlib import Path
@@ -16,13 +17,15 @@ PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 # 2. LOAD HISTORICAL + SSP DATA
 # ==========================================================
 
+# 1960-2020
 url_final = "https://raw.githubusercontent.com/AntongZ1/Data/main/finaldata0411.csv"
-
+# 2020-2060
 url_ssp126 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs126.csv"
 url_ssp245 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs245.csv"
 url_ssp370 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs370.csv"
 url_ssp585 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs585.csv"
 
+# 1960-2020
 finaldata = pd.read_csv(url_final)
 
 ssp126 = pd.read_csv(url_ssp126)
@@ -70,6 +73,11 @@ model = lgb.LGBMRegressor(
 )
 
 model.fit(X_train, y_train)
+
+# Save model for use in random_forest_ec_global_ratio.py
+MODEL_PATH = Path("ec_model.joblib")
+joblib.dump(model, MODEL_PATH)
+print("Saved EC model to", MODEL_PATH)
 
 # ==========================================================
 # 5. VALIDATION
