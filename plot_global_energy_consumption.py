@@ -8,6 +8,7 @@ Forecast (2020-2100): A/B, scaled so that 2020 equals the historical value (line
 Forecast + AI energy (2027-2100): Global EC + AI energy from get_ai_energy_for_years (red dashed).
 """
 
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -31,6 +32,14 @@ FORECAST_YEAR_MIN = 2020
 FORECAST_YEAR_MAX = 2100
 AI_ENERGY_PLOT_YEAR_MIN = 2027
 
+# Kardashev scale index K: power in watts -> K = (log10(P_W) - 6) / 10; P_W = y_EJ * 1e18 / (365*24*3600)
+def _kardashev_k(y_ej):
+    """Convert global energy consumption (EJ/year) to Kardashev scale index K."""
+    y = y_ej #np.maximum(np.asarray(y_ej, dtype=float), 1e-30)
+    power_watts = y * 1e18 / (365 * 24 * 60 * 60)
+    return (np.log10(power_watts) - 6) / 10
+
+print(_kardashev_k(500))
 
 def load_historical_global_ec() -> pd.DataFrame:
     """Load historical global EC (EJ) for 1970-2020 from ARIMA input data."""
@@ -170,6 +179,17 @@ def main():
     plt.legend()
     plt.grid(True, linestyle="--", alpha=0.5)
     plt.xlim(1965, 2105)
+
+    # Right y-axis: get primary axis y ticks (global EC in EJ), compute K for each, put on right
+    ax1 = plt.gca()
+    left_ticks_ej = ax1.get_yticks()
+    k_values = [float(_kardashev_k(t)) for t in left_ticks_ej]
+    ax2 = ax1.twinx()
+    ax2.set_ylim(ax1.get_ylim()[0], ax1.get_ylim()[1])
+    ax2.set_yticks(left_ticks_ej)
+    ax2.set_yticklabels([f"{k:.4f}" for k in k_values])
+    ax2.set_ylabel("index K on the Kardashev Scale")
+
     out_path = PLOTS_DIR / "global_energy_consumption.png"
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
