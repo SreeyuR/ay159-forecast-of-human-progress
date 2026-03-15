@@ -3,16 +3,14 @@ Train a Random Forest to predict the ratio:
   (total energy consumption of 42 countries) / (global energy consumption).
 
 Features:
-  1. EC_42 / GDP_42  (EC_42: actual data 1970--2019, EC model 2020--2100)
+  1. EC_42 / GDP_42
   2. GDP_42 / GDP_global
   3. Population_42 / Population_global
 
-- Years 1970--2019: EC per country from finaldata0411.csv (actual data); sum for
-  total EC of 42 countries. No EC model used.
-- Years 2020--2100: EC per country from ec_model prediction; then sum for EC_42.
+Training (1970--2019): actual EC from finaldata0411 only; GDP and Population from ARIMA CSVs; no ec_model.
+Test/predict (2020--2100): GDP/Pop from ARIMA; EC_42 from ec_model.
 
-Training: 1970--2019 (target = actual ratio from data).
-Test/predict: 2020--2100 (target unknown; we predict the ratio).
+Data: finaldata0411 = EC per country 1970--2019 only. All GDP and Population from ARIMA; global_EC from ARIMA Global EC.
 """
 
 import pandas as pd
@@ -24,14 +22,16 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
+from ai_energy import get_ai_energy_for_years, get_ai_energy_uncertainty_for_years
+
 # ---------------------------------------------------------------------------
 # Paths and config
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(__file__).resolve().parent / "data"
 EC_MODEL_PATH = DATA_DIR / "ec_model.joblib"
 PLOTS_DIR = DATA_DIR / "plots"
-OUTPUT_DATA_DIR = DATA_DIR / "data"  # CSVs for training/test inputs, features, and ratios
+OUTPUT_DATA_DIR = DATA_DIR # CSVs for training/test inputs, features, and ratios
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,8 +52,15 @@ COUNTRY_TO_CODE = {
 EC_FEATURES = ["Year", "GDP", "Population", "Country Code"]
 TRAIN_YEAR_MIN = 1970
 TRAIN_YEAR_MAX = 2019
-TEST_YEAR_MIN = 2020
+TEST_YEAR_MIN = 2019  # Include 2019 so plot connects with training (1970-2019)
 TEST_YEAR_MAX = 2100
+
+# Map ARIMA CSV country column names to COUNTRY_TO_CODE keys (GDP uses long names)
+ARIMA_COUNTRY_TO_STANDARD = {
+    "Korea, Republic of": "Korea",
+    "United Kingdom of Great Britain and Northern Ireland": "UK",
+    "United States of America": "USA",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -151,42 +158,81 @@ def wide_to_long_gdp(df_wide: pd.DataFrame, value_name: str) -> pd.DataFrame:
     return df_wide.melt(id_vars=id_vars, var_name=var_name, value_name=value_name)
 
 
+def _normalize_arima_country(name: str) -> str:
+    """Map ARIMA CSV country name to COUNTRY_TO_CODE key."""
+    s = str(name).strip()
+    return ARIMA_COUNTRY_TO_STANDARD.get(s, s)
+
+
+# Actual EC per country for 1970--2019: local file or fetch from URL.
+HISTORICAL_EC_PATH = DATA_DIR / "finaldata0411.csv"
+HISTORICAL_EC_URL = "https://raw.githubusercontent.com/AntongZ1/Data/main/finaldata0411.csv"
+
+
+def load_historical_ec_only_42(year_min: int, year_max: int) -> pd.DataFrame:
+    """Load actual EC only for 42 countries from finaldata0411 (local or URL). One row per (Year, Country Code). GDP and Population for all years come from ARIMA CSVs."""
+    if HISTORICAL_EC_PATH.exists():
+        df = pd.read_csv(HISTORICAL_EC_PATH)
+    else:
+        df = pd.read_csv(HISTORICAL_EC_URL)
+        df.to_csv(HISTORICAL_EC_PATH, index=False)  # cache for next time
+    df = df.dropna(subset=["Year", "Country Code", "EC"])
+    df["Year"] = df["Year"].astype(int)
+    df = df[(df["Year"] >= year_min) & (df["Year"] <= year_max)]
+    country_codes_42 = set(COUNTRY_TO_CODE.values())
+    df = df[df["Country Code"].isin(country_codes_42)]
+    return df[["Year", "Country Code", "EC"]]
+
+
+def get_arima_gdp_pop_42(year_min: int, year_max: int) -> pd.DataFrame:
+    """Load GDP and Population from ARIMA CSVs for 42 countries in [year_min, year_max]; one row per (Year, Country Code)."""
+    gdp_df = load_gdp_arima()
+    pop_df = load_pop_arima()
+    gdp_df.columns = [c.strip() if isinstance(c, str) else c for c in gdp_df.columns]
+    pop_df.columns = [c.strip() if isinstance(c, str) else c for c in pop_df.columns]
+    gdp_df = gdp_df[(gdp_df["Year"] >= year_min) & (gdp_df["Year"] <= year_max)]
+    pop_df = pop_df[(pop_df["Year"] >= year_min) & (pop_df["Year"] <= year_max)]
+    # Melt and restrict to 42 countries with consistent naming
+    gdp_long = wide_to_long_gdp(gdp_df.drop(columns=["Global"], errors="ignore"), "GDP")
+    gdp_long["Country_std"] = gdp_long["Country"].apply(_normalize_arima_country)
+    gdp_long["Country Code"] = gdp_long["Country_std"].map(COUNTRY_TO_CODE)
+    gdp_long = gdp_long.dropna(subset=["Country Code"])[["Year", "Country Code", "GDP"]]
+    pop_long = wide_to_long_gdp(pop_df.drop(columns=["Global"], errors="ignore"), "Population")
+    pop_long["Country_std"] = pop_long["Country"].apply(_normalize_arima_country)
+    pop_long["Country Code"] = pop_long["Country_std"].map(COUNTRY_TO_CODE)
+    pop_long = pop_long.dropna(subset=["Country Code"])[["Year", "Country Code", "Population"]]
+    merged = gdp_long.merge(pop_long, on=["Year", "Country Code"], how="inner")
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Build training data (1970--2019)
 # ---------------------------------------------------------------------------
 
 def build_training_data(ec_model) -> pd.DataFrame:
-    # 1970--2019: use actual EC from finaldata0411.csv (do not use ec_model)
-    url_final = "https://raw.githubusercontent.com/AntongZ1/Data/main/finaldata0411.csv"
-    finaldata = pd.read_csv(url_final)
-    finaldata = finaldata[
-        (finaldata["Year"] >= TRAIN_YEAR_MIN) & (finaldata["Year"] <= TRAIN_YEAR_MAX)
-    ].copy()
-    finaldata = finaldata.dropna(subset=["Year", "EC", "GDP", "Population"])
-    # Restrict to the 42 countries; sum actual EC (not model) for total EC_42
-    country_codes_42 = set(COUNTRY_TO_CODE.values())
-    finaldata = finaldata[finaldata["Country Code"].isin(country_codes_42)]
-
-    # Yearly aggregates: EC_42 = sum of actual energy consumption from CSV
-    by_year = finaldata.groupby("Year").agg(
+    # 1970--2019: EC from finaldata0411 only; GDP and Population from ARIMA CSVs (no model for training).
+    historical_ec = load_historical_ec_only_42(TRAIN_YEAR_MIN, TRAIN_YEAR_MAX)
+    arima_42 = get_arima_gdp_pop_42(TRAIN_YEAR_MIN, TRAIN_YEAR_MAX)
+    arima_42 = arima_42.dropna(subset=["Year", "GDP", "Population"])
+    merged = arima_42.merge(historical_ec, on=["Year", "Country Code"], how="inner")
+    by_year = merged.groupby("Year", as_index=False).agg(
         EC_42=("EC", "sum"),
         GDP_42=("GDP", "sum"),
         Population_42=("Population", "sum"),
-    ).reset_index()
+    )
 
-    # Global EC
+    # Global EC from ARIMA input data - Global EC.csv
     global_ec = load_global_ec()
     global_ec = global_ec[(global_ec["Year"] >= TRAIN_YEAR_MIN) & (global_ec["Year"] <= TRAIN_YEAR_MAX)]
     by_year = by_year.merge(global_ec[["Year", "global_EC"]], on="Year", how="left")
 
-    # Global GDP from ARIMA input data - GDP.csv (Global column)
+    # Global GDP and Population from ARIMA input data
     global_gdp = load_global_gdp_historical()
     global_gdp = global_gdp[
         (global_gdp["Year"] >= TRAIN_YEAR_MIN) & (global_gdp["Year"] <= TRAIN_YEAR_MAX)
     ].drop_duplicates(subset=["Year"])
     by_year = by_year.merge(global_gdp[["Year", "GDP_global"]], on="Year", how="left")
 
-    # Global population from ARIMA input data - Population.csv (Global column)
     global_pop = load_global_pop_historical()
     global_pop = global_pop[
         (global_pop["Year"] >= TRAIN_YEAR_MIN) & (global_pop["Year"] <= TRAIN_YEAR_MAX)
@@ -201,7 +247,6 @@ def build_training_data(ec_model) -> pd.DataFrame:
     by_year["feat_GDP42_over_GDPglobal"] = by_year["GDP_42"] / by_year["GDP_global"]
     by_year["feat_Pop42_over_Popglobal"] = by_year["Population_42"] / by_year["Population_global"]
 
-    # Drop rows with NaN (missing global EC, global GDP, or global population)
     by_year = by_year.dropna()
     return by_year
 
@@ -211,49 +256,17 @@ def build_training_data(ec_model) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_test_inputs(ec_model) -> pd.DataFrame:
-    """Build feature rows for 2020--2100. EC_42 from ec_model (no actual data). No target (we predict it)."""
-    url_ssp = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs126.csv"
-    gdp_arima = load_gdp_arima()
-    pop_arima = load_pop_arima()
-    pop_arima = pop_arima.rename(columns={c: c.strip() for c in pop_arima.columns})
+    """Build feature rows for 2020--2100. All data from ARIMA CSVs; EC_42 from ec_model."""
+    # All test years from ARIMA GDP and Population (all countries, all years in CSVs)
+    arima_42 = get_arima_gdp_pop_42(TEST_YEAR_MIN, TEST_YEAR_MAX)
+    arima_42 = arima_42.dropna(subset=["Year", "GDP", "Population"])
 
-    # ----- 2020--2060: from inputs126 -----
-    ssp = pd.read_csv(url_ssp)
-    ssp = ssp[(ssp["Year"] >= TEST_YEAR_MIN) & (ssp["Year"] <= 2060)].copy()
-    ssp = ssp.dropna(subset=["Year", "GDP", "Population"])
-
-    ec_sum_ssp = predict_ec_42(ec_model, ssp)
-    gdp_42_ssp = ssp.groupby("Year", as_index=False)["GDP"].sum().rename(columns={"GDP": "GDP_42"})
-    pop_42_ssp = ssp.groupby("Year", as_index=False)["Population"].sum().rename(columns={"Population": "Population_42"})
-    merge_2020_2060 = ec_sum_ssp.merge(gdp_42_ssp, on="Year").merge(pop_42_ssp, on="Year")
-
-    # ----- 2061--2100: from ARIMA GDP/Pop (wide) -----
-    gdp_future = gdp_arima[gdp_arima["Year"] >= 2061].copy()
-    pop_future = pop_arima[pop_arima["Year"] >= 2061].copy()
-
-    # Exclude "Global" when building per-country table for EC model
-    country_cols = [c for c in gdp_future.columns if c != "Year" and c != "Global"]
-    gdp_long = wide_to_long_gdp(gdp_future[["Year"] + country_cols], "GDP")
-    pop_country_cols = [c for c in pop_future.columns if c != "Year" and c != "Global"]
-    pop_long = wide_to_long_gdp(pop_future[["Year"] + pop_country_cols], "Population")
-    future = gdp_long.merge(pop_long, on=["Year", "Country"])
-    future["Country Code"] = future["Country"].map(COUNTRY_TO_CODE)
-    future = future.dropna(subset=["Country Code"])
-    future = future[EC_FEATURES]
-
-    ec_sum_future = predict_ec_42(ec_model, future)
-    gdp_42_future = gdp_long.groupby("Year", as_index=False)["GDP"].sum().rename(columns={"GDP": "GDP_42"})
-    pop_42_future = pop_long.groupby("Year", as_index=False)["Population"].sum().rename(columns={"Population": "Population_42"})
-    merge_2061_2100 = (
-        ec_sum_future.merge(gdp_42_future, on="Year").merge(pop_42_future, on="Year")
+    ec_sum = predict_ec_42(ec_model, arima_42[EC_FEATURES])
+    by_year = arima_42.groupby("Year", as_index=False).agg(
+        GDP_42=("GDP", "sum"),
+        Population_42=("Population", "sum"),
     )
-
-    # Combine 2020--2060 and 2061--2100
-    test_years = (
-        pd.concat([merge_2020_2060, merge_2061_2100])
-        .drop_duplicates(subset=["Year"])
-        .sort_values("Year")
-    )
+    test_years = by_year.merge(ec_sum, on="Year", how="left")
 
     # Global GDP from ARIMA input data - GDP.csv (Global column) for all test years
     global_gdp = load_global_gdp_historical()
@@ -355,21 +368,80 @@ def main():
     joblib.dump(ratio_model, DATA_DIR / "ec_global_ratio_model.joblib")
     print("Saved ratio model to ec_global_ratio_model.joblib")
 
-    # Plot: year vs ratio — blue 1970–2020 (training), orange 2020–2100 (predictions)
+    # Plot: year vs ratio — blue 1970–2019 (training), orange 2019–2100 (predictions); dashed = + AI
+    test_plot = test_df.copy()
+    train_2019 = train_df.loc[train_df["Year"] == 2019, "target_ratio"]
+    if not train_2019.empty:
+        test_plot.loc[test_plot["Year"] == 2019, "predicted_ratio"] = train_2019.values[0]
+    # AI effect: ratio = (total EC 42 countries + AI energy) / global_EC for 2027–2100
+    AI_DASHED_YEAR_MIN = 2027
+    AI_DASHED_YEAR_MAX = 2100
+    global_ec = load_global_ec()
+    global_ec_test = global_ec[
+        (global_ec["Year"] >= TEST_YEAR_MIN) & (global_ec["Year"] <= TEST_YEAR_MAX)
+    ].drop_duplicates(subset=["Year"])
+    test_with_global = test_df.merge(global_ec_test[["Year", "global_EC"]], on="Year", how="left")
+    # ARIMA Global EC CSV ends at 2024; for 2025+ use implied global_EC = Predicted_EC / predicted_ratio
+    test_with_global["global_EC_filled"] = test_with_global["global_EC"].fillna(
+        test_with_global["Predicted_EC"] / test_with_global["predicted_ratio"]
+    )
+    ai_energy = get_ai_energy_for_years(test_with_global["Year"].values)
+    _, ai_lower, ai_upper = get_ai_energy_uncertainty_for_years(test_with_global["Year"].values)
+    # ratio = (total EC 42 countries + AI energy) / global_EC for 2020–2100
+    ratio_with_ai = (
+        (test_with_global["Predicted_EC"].values + ai_energy)
+        / test_with_global["global_EC_filled"].values
+    )
+    ratio_with_ai_lower = (
+        (test_with_global["Predicted_EC"].values + ai_lower)
+        / test_with_global["global_EC_filled"].values
+    )
+    ratio_with_ai_upper = (
+        (test_with_global["Predicted_EC"].values + ai_upper)
+        / test_with_global["global_EC_filled"].values
+    )
+    mask_ai = (test_with_global["Year"] >= AI_DASHED_YEAR_MIN) & (test_with_global["Year"] <= AI_DASHED_YEAR_MAX)
+    years_ai = test_with_global.loc[mask_ai, "Year"].values
+    ratio_ai_plot = ratio_with_ai[mask_ai.to_numpy()]
+    ratio_ai_lower = ratio_with_ai_lower[mask_ai.to_numpy()]
+    ratio_ai_upper = ratio_with_ai_upper[mask_ai.to_numpy()]
     plt.figure(figsize=(10, 6))
     plt.plot(
         train_df["Year"],
         train_df["target_ratio"],
         color="blue",
         linewidth=2,
-        label="Training (1970–2020)",
+        label="Training (1970–2019)",
+    )
+    pred_color = "tab:green"
+    plt.plot(
+        test_plot["Year"],
+        test_plot["predicted_ratio"],
+        color=pred_color,
+        linewidth=2,
+        label="Predictions (2019–2100)",
+    )
+    plt.fill_between(
+        test_plot["Year"],
+        test_plot["predicted_ratio"] - 0.02,
+        test_plot["predicted_ratio"] + 0.02,
+        color=pred_color,
+        alpha=0.3,
+    )
+    plt.fill_between(
+        years_ai,
+        ratio_ai_lower,
+        ratio_ai_upper,
+        color="tab:purple",
+        alpha=0.3,
     )
     plt.plot(
-        test_df["Year"],
-        test_df["predicted_ratio"],
-        color="orange",
+        years_ai,
+        ratio_ai_plot,
+        color="tab:purple",
         linewidth=2,
-        label="Predictions (2020–2100)",
+        linestyle="--",
+        label="Predictions + AI energy (2027–2100)",
     )
     plt.xlabel("Year")
     plt.ylabel("Ratio (EC_42 / Global EC)")

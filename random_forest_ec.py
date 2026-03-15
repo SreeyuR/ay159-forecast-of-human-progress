@@ -1,10 +1,13 @@
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import lightgbm as lgb
 import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from pathlib import Path
+
+from ai_energy import get_ai_energy_for_years, get_ai_energy_uncertainty_for_years
 
 # ==========================================================
 # 1. OUTPUT FOLDER
@@ -13,25 +16,19 @@ from pathlib import Path
 PLOTS_DIR = Path("plots")
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ==========================================================
-# 2. LOAD HISTORICAL + SSP DATA
+# 2. LOAD DATA: EC FROM URL, GDP/POPULATION FROM ARIMA FILES
 # ==========================================================
 
-# 1960-2020
+# Energy consumption for training (1970-2020, 42 countries)
 url_final = "https://raw.githubusercontent.com/AntongZ1/Data/main/finaldata0411.csv"
-# 2020-2060
-url_ssp126 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs126.csv"
-url_ssp245 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs245.csv"
-url_ssp370 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs370.csv"
-url_ssp585 = "https://raw.githubusercontent.com/AntongZ1/Data/main/inputs585.csv"
-
-# 1960-2020
 finaldata = pd.read_csv(url_final)
 
-ssp126 = pd.read_csv(url_ssp126)
-ssp245 = pd.read_csv(url_ssp245)
-ssp370 = pd.read_csv(url_ssp370)
-ssp585 = pd.read_csv(url_ssp585)
+# GDP and Population for ALL years from local ARIMA files only
+gdp_arima = pd.read_csv("data/ARIMA input data - GDP.csv")
+pop_arima = pd.read_csv("data/ARIMA input data - Population.csv")
 
 # ==========================================================
 # 3. FEATURES
@@ -47,10 +44,88 @@ features = [
 target = "EC"
 
 # ==========================================================
-# 4. TRAIN MODEL
+# 3b. COUNTRY CODE MAPPING + ARIMA GDP/POPULATION (ALL YEARS)
 # ==========================================================
 
-train_data = finaldata[finaldata["Year"] < 2020].copy()
+country_to_code = {
+    "Australia": 36,
+    "Austria": 40,
+    "Belgium": 56,
+    "Canada": 124,
+    "Czechia": 203,
+    "Denmark": 208,
+    "Finland": 246,
+    "France": 250,
+    "Germany": 276,
+    "Greece": 300,
+    "Hungary": 348,
+    "Iceland": 352,
+    "Ireland": 372,
+    "Italy": 380,
+    "Japan": 392,
+    "Korea": 410,
+    "Luxembourg": 442,
+    "Mexico": 484,
+    "Netherlands": 528,
+    "New Zealand": 554,
+    "Norway": 578,
+    "Poland": 616,
+    "Portugal": 620,
+    "Slovakia": 703,
+    "UK": 826,
+    "USA": 840,
+    "Argentina": 32,
+    "Brazil": 76,
+    "Chile": 152,
+    "China": 156,
+    "Colombia": 170,
+    "India": 356,
+    "Indonesia": 360,
+    "Israel": 376,
+    "Saudi Arabia": 682,
+    "South Africa": 710,
+    "Bulgaria": 100,
+    "Romania": 642
+}
+
+# Map ARIMA file column names to country_to_code keys (strip spaces, long names)
+def _normalize_arima_columns(df, drop_global=True):
+    df = df.copy()
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+    rename = {
+        "Korea, Republic of": "Korea",
+        "United Kingdom of Great Britain and Northern Ireland": "UK",
+        "United States of America": "USA",
+    }
+    df = df.rename(columns=rename)
+    if drop_global and "Global" in df.columns:
+        df = df.drop(columns=["Global"])
+    # Pandas may read duplicate "Israel" as "Israel.1"; map to "Israel" then keep one column
+    if "Israel.1" in df.columns:
+        df = df.drop(columns=["Israel.1"])
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    return df
+
+gdp_arima = _normalize_arima_columns(gdp_arima)
+pop_arima = _normalize_arima_columns(pop_arima)
+
+def _wide_to_long(df, value_name):
+    return df.melt(id_vars="Year", var_name="Country", value_name=value_name)
+
+gdp_long = _wide_to_long(gdp_arima, "GDP")
+pop_long = _wide_to_long(pop_arima, "Population")
+
+arima_long = gdp_long.merge(pop_long, on=["Year", "Country"])
+arima_long["Country Code"] = arima_long["Country"].map(country_to_code)
+arima_long = arima_long.dropna(subset=["Country Code"])
+
+# ==========================================================
+# 4. TRAIN MODEL
+# ==========================================================
+# Use EC from finaldata, GDP and Population from ARIMA for all training years.
+ec_from_final = finaldata[finaldata["Year"] < 2020][["Year", "Country Code", "EC"]].copy()
+train_arima = arima_long[arima_long["Year"] < 2020][["Year", "Country Code", "GDP", "Population"]].copy()
+train_data = ec_from_final.merge(train_arima, on=["Year", "Country Code"], how="inner")
 
 X = train_data[features].copy()
 y = train_data[target]
@@ -98,166 +173,96 @@ historical_global = (
 )
 
 # ==========================================================
-# 7. SSP SCENARIO PREDICTION (2020–2060)
+# 7. FORECAST 2020–2100 USING ARIMA GDP/POPULATION ONLY
 # ==========================================================
 
-def predict_scenario(df):
+future_arima = arima_long[arima_long["Year"] >= 2020].copy()
+X_future = future_arima[features].copy()
+X_future["Country Code"] = X_future["Country Code"].astype("category")
+future_arima["Predicted_EC"] = model.predict(X_future)
 
-    X_future = df[features].copy()
-    X_future["Country Code"] = X_future["Country Code"].astype("category")
-
-    df = df.copy()
-    df["Predicted_EC"] = model.predict(X_future)
-
-    yearly = (
-        df.groupby("Year", as_index=False)["Predicted_EC"]
-        .sum()
-    )
-
-    return yearly
-
-ssp126_year = predict_scenario(ssp126)
-ssp245_year = predict_scenario(ssp245)
-ssp370_year = predict_scenario(ssp370)
-ssp585_year = predict_scenario(ssp585)
-
-# ==========================================================
-# 8. COUNTRY NAME TO COUNTRY CODE
-# ==========================================================
-
-country_to_code = {
-    "Australia": 36,
-    "Austria": 40,
-    "Belgium": 56,
-    "Canada": 124,
-    "Czechia": 203,
-    "Denmark": 208,
-    "Finland": 246,
-    "France": 250,
-    "Germany": 276,
-    "Greece": 300,
-    "Hungary": 348,
-    "Iceland": 352,
-    "Ireland": 372,
-    "Italy": 380,
-    "Japan": 392,
-    "Korea": 410,
-    "Luxembourg": 442,
-    "Mexico": 484,
-    "Netherlands": 528,
-    "New Zealand": 554,
-    "Norway": 578,
-    "Poland": 616,
-    "Portugal": 620,
-    "Slovakia": 703,
-    "UK": 826,
-    "USA": 840,
-    "Argentina": 32,
-    "Brazil": 76,
-    "Chile": 152,
-    "China": 156,
-    "Colombia": 170,
-    "India": 356,
-    "Indonesia": 360,
-    "Israel": 376,
-    "Saudi Arabia": 682,
-    "South Africa": 710,
-    "Bulgaria": 100,
-    "Romania": 642
-}
-
-# ==========================================================
-# 9. LOAD FUTURE GDP + POPULATION (2061–2100)
-# ==========================================================
-
-gdp_future = pd.read_csv("ARIMA input data - GDP.csv")
-pop_future = pd.read_csv("ARIMA input data - Population.csv")
-
-gdp_future = gdp_future[gdp_future["Year"] >= 2061]
-pop_future = pop_future[pop_future["Year"] >= 2061]
-
-def wide_to_long(df, value_name):
-    return df.melt(
-        id_vars="Year",
-        var_name="Country",
-        value_name=value_name
-    )
-
-gdp_long = wide_to_long(gdp_future, "GDP")
-pop_long = wide_to_long(pop_future, "Population")
-
-future_proj = gdp_long.merge(
-    pop_long,
-    on=["Year", "Country"]
+future_yearly = (
+    future_arima.groupby("Year", as_index=False)["Predicted_EC"]
+    .sum()
 )
 
-future_proj["Country Code"] = future_proj["Country"].map(country_to_code)
-future_proj = future_proj.dropna()
+# Total EC + AI energy (2020–2100) for dashed line showing impact of AI
+years_2020_2100 = future_yearly["Year"].values
+ai_energy_ej = get_ai_energy_for_years(years_2020_2100)
+future_yearly_plus_ai = future_yearly.copy()
+future_yearly_plus_ai["EC_plus_AI"] = future_yearly_plus_ai["Predicted_EC"] + ai_energy_ej
+_, ai_lower, ai_upper = get_ai_energy_uncertainty_for_years(years_2020_2100)
+future_yearly_plus_ai["EC_plus_AI_lower"] = future_yearly_plus_ai["Predicted_EC"] + ai_lower
+future_yearly_plus_ai["EC_plus_AI_upper"] = future_yearly_plus_ai["Predicted_EC"] + ai_upper
+# Plot "Predictions + AI energy" only from 2027 onward
+future_yearly_plus_ai_from_2027 = future_yearly_plus_ai[future_yearly_plus_ai["Year"] >= 2027].copy()
 
-# ==========================================================
-# 10. FUTURE PREDICTION (2061–2100)
-# ==========================================================
-
-X_proj = future_proj[features].copy()
-X_proj["Country Code"] = X_proj["Country Code"].astype("category")
-
-future_proj["Predicted_EC"] = model.predict(X_proj)
-
+# Country-level output 2020–2100 for CSV; 2061–2100 subset for zoom plot and global CSV
+future_proj = future_arima.copy()  # 2020–2100
 future_2100 = (
-    future_proj.groupby("Year", as_index=False)["Predicted_EC"]
+    future_proj[future_proj["Year"] >= 2061]
+    .groupby("Year", as_index=False)["Predicted_EC"]
     .sum()
 )
 
 # ==========================================================
-# 11. EXTEND ALL SSPs TO 2100
-# ==========================================================
-
-ssp126_extended = pd.concat([ssp126_year, future_2100])
-ssp245_extended = pd.concat([ssp245_year, future_2100])
-ssp370_extended = pd.concat([ssp370_year, future_2100])
-ssp585_extended = pd.concat([ssp585_year, future_2100])
-
-# ==========================================================
 # 12. FULL RANGE PLOT (1960–2100)
 # ==========================================================
+# Blue line ends at 2020 with the forecast value at 2020 so it connects to green
+historical_global_plot = historical_global.copy()
+pred_2020 = future_yearly[future_yearly["Year"] == 2020]
+if not pred_2020.empty:
+    predicted_total_2020 = pred_2020["Predicted_EC"].iloc[0]
+    mask_2020 = historical_global_plot["Year"] == 2020
+    if mask_2020.any():
+        historical_global_plot.loc[mask_2020, "EC"] = predicted_total_2020
+    else:
+        historical_global_plot = pd.concat([
+            historical_global_plot,
+            pd.DataFrame({"Year": [2020], "EC": [predicted_total_2020]})
+        ], ignore_index=True).sort_values("Year").reset_index(drop=True)
+# Forecast plot: 2020–2100 only
+future_yearly_plot = future_yearly
 
 plt.figure(figsize=(12,6))
 
 plt.plot(
-    historical_global["Year"],
-    historical_global["EC"],
+    historical_global_plot["Year"],
+    historical_global_plot["EC"],
     label="Historical data",
     linewidth=2,
     color="blue"
 )
 
 plt.plot(
-    ssp126_extended["Year"],
-    ssp126_extended["Predicted_EC"],
-    label="Forecast (ssp126)",
-    color="tab:blue",
-    linewidth=2,
-)
-plt.plot(
-    ssp245_extended["Year"],
-    ssp245_extended["Predicted_EC"],
-    label="Forecast (ssp245)",
+    future_yearly_plot["Year"],
+    future_yearly_plot["Predicted_EC"],
+    label="Forecast (ARIMA GDP/Population)",
     color="tab:green",
     linewidth=2,
 )
-plt.plot(
-    ssp370_extended["Year"],
-    ssp370_extended["Predicted_EC"],
-    label="Forecast (ssp370)",
+y_err = 0.02 * future_yearly_plot["Predicted_EC"].values
+plt.fill_between(
+    future_yearly_plot["Year"],
+    future_yearly_plot["Predicted_EC"] - y_err,
+    future_yearly_plot["Predicted_EC"] + y_err,
+    color="tab:green",
+    alpha=0.3,
+)
+plt.fill_between(
+    future_yearly_plus_ai_from_2027["Year"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI_lower"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI_upper"],
     color="tab:orange",
-    linewidth=2,
+    alpha=0.3,
 )
 plt.plot(
-    ssp585_extended["Year"],
-    ssp585_extended["Predicted_EC"],
-    label="Forecast (ssp585)",
-    color="tab:red",
+    future_yearly_plus_ai_from_2027["Year"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI"],
+    label="Forecast + AI energy",
+    color="tab:orange",
     linewidth=2,
+    linestyle="--",
 )
 
 plt.xlim(1965, 2100)
@@ -278,33 +283,37 @@ plt.close()
 
 plt.figure(figsize=(10,6))
 
+zoom_2060 = future_yearly[future_yearly["Year"].between(2020, 2060)]
+zoom_2060_plus_ai = future_yearly_plus_ai_from_2027[future_yearly_plus_ai_from_2027["Year"].between(2027, 2060)]
 plt.plot(
-    ssp126_year["Year"],
-    ssp126_year["Predicted_EC"],
-    label="Forecast (ssp126)",
-    color="tab:blue",
-    linewidth=2,
-)
-plt.plot(
-    ssp245_year["Year"],
-    ssp245_year["Predicted_EC"],
-    label="Forecast (ssp245)",
+    zoom_2060["Year"],
+    zoom_2060["Predicted_EC"],
+    label="Forecast (ARIMA GDP/Population)",
     color="tab:green",
     linewidth=2,
 )
-plt.plot(
-    ssp370_year["Year"],
-    ssp370_year["Predicted_EC"],
-    label="Forecast (ssp370)",
+y_err = 0.02 * zoom_2060["Predicted_EC"].values
+plt.fill_between(
+    zoom_2060["Year"],
+    zoom_2060["Predicted_EC"] - y_err,
+    zoom_2060["Predicted_EC"] + y_err,
+    color="tab:green",
+    alpha=0.3,
+)
+plt.fill_between(
+    zoom_2060_plus_ai["Year"],
+    zoom_2060_plus_ai["EC_plus_AI_lower"],
+    zoom_2060_plus_ai["EC_plus_AI_upper"],
     color="tab:orange",
-    linewidth=2,
+    alpha=0.3,
 )
 plt.plot(
-    ssp585_year["Year"],
-    ssp585_year["Predicted_EC"],
-    label="Forecast (ssp585)",
-    color="tab:red",
+    zoom_2060_plus_ai["Year"],
+    zoom_2060_plus_ai["EC_plus_AI"],
+    label="Forecast + AI energy",
+    color="tab:orange",
     linewidth=2,
+    linestyle="--",
 )
 
 plt.xlim(2020, 2060)
@@ -327,32 +336,34 @@ plt.close()
 plt.figure(figsize=(10, 6))
 
 plt.plot(
-    ssp126_extended["Year"],
-    ssp126_extended["Predicted_EC"],
-    label="Forecast (ssp126)",
-    color="tab:blue",
-    linewidth=2,
-)
-plt.plot(
-    ssp245_extended["Year"],
-    ssp245_extended["Predicted_EC"],
-    label="Forecast (ssp245)",
+    future_yearly["Year"],
+    future_yearly["Predicted_EC"],
+    label="Forecast (ARIMA GDP/Population)",
     color="tab:green",
     linewidth=2,
 )
-plt.plot(
-    ssp370_extended["Year"],
-    ssp370_extended["Predicted_EC"],
-    label="Forecast (ssp370)",
+y_err = 0.02 * future_yearly["Predicted_EC"].values
+plt.fill_between(
+    future_yearly["Year"],
+    future_yearly["Predicted_EC"] - y_err,
+    future_yearly["Predicted_EC"] + y_err,
+    color="tab:green",
+    alpha=0.3,
+)
+plt.fill_between(
+    future_yearly_plus_ai_from_2027["Year"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI_lower"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI_upper"],
     color="tab:orange",
-    linewidth=2,
+    alpha=0.3,
 )
 plt.plot(
-    ssp585_extended["Year"],
-    ssp585_extended["Predicted_EC"],
-    label="Forecast (ssp585)",
-    color="tab:red",
+    future_yearly_plus_ai_from_2027["Year"],
+    future_yearly_plus_ai_from_2027["EC_plus_AI"],
+    label="Forecast + AI energy",
+    color="tab:orange",
     linewidth=2,
+    linestyle="--",
 )
 
 plt.xlim(2020, 2100)
@@ -374,53 +385,39 @@ plt.close()
 
 plt.figure(figsize=(10, 6))
 
+future_2100_plus_ai = future_yearly_plus_ai_from_2027[future_yearly_plus_ai_from_2027["Year"] >= 2061]
 plt.plot(
-    ssp126_extended["Year"],
-    ssp126_extended["Predicted_EC"],
-    label="Forecast (ssp126)",
-    color="tab:blue",
-    linewidth=2,
-)
-plt.plot(
-    ssp245_extended["Year"],
-    ssp245_extended["Predicted_EC"],
-    label="Forecast (ssp245)",
+    future_2100["Year"],
+    future_2100["Predicted_EC"],
+    label="Forecast (ARIMA GDP/Population)",
     color="tab:green",
     linewidth=2,
 )
-plt.plot(
-    ssp370_extended["Year"],
-    ssp370_extended["Predicted_EC"],
-    label="Forecast (ssp370)",
+y_err = 0.02 * future_2100["Predicted_EC"].values
+plt.fill_between(
+    future_2100["Year"],
+    future_2100["Predicted_EC"] - y_err,
+    future_2100["Predicted_EC"] + y_err,
+    color="tab:green",
+    alpha=0.3,
+)
+plt.fill_between(
+    future_2100_plus_ai["Year"],
+    future_2100_plus_ai["EC_plus_AI_lower"],
+    future_2100_plus_ai["EC_plus_AI_upper"],
     color="tab:orange",
-    linewidth=2,
+    alpha=0.3,
 )
 plt.plot(
-    ssp585_extended["Year"],
-    ssp585_extended["Predicted_EC"],
-    label="Forecast (ssp585)",
-    color="tab:red",
+    future_2100_plus_ai["Year"],
+    future_2100_plus_ai["EC_plus_AI"],
+    label="Forecast + AI energy",
+    color="tab:orange",
     linewidth=2,
+    linestyle="--",
 )
 
 plt.xlim(2061, 2100)
-
-# Tighten y-axis to highlight trends in 2061–2100 window
-zoom_window = lambda df: df[df["Year"].between(2061, 2100)]["Predicted_EC"]
-zoom_min = min(
-    zoom_window(ssp126_extended).min(),
-    zoom_window(ssp245_extended).min(),
-    zoom_window(ssp370_extended).min(),
-    zoom_window(ssp585_extended).min(),
-)
-zoom_max = max(
-    zoom_window(ssp126_extended).max(),
-    zoom_window(ssp245_extended).max(),
-    zoom_window(ssp370_extended).max(),
-    zoom_window(ssp585_extended).max(),
-)
-pad = (zoom_max - zoom_min) * 0.08 if zoom_max > zoom_min else 10
-plt.ylim(zoom_min - pad, zoom_max + pad)
 
 plt.xlabel("Year")
 plt.ylabel("Total Energy Consumption (EJ)")
@@ -437,7 +434,7 @@ plt.close()
 # 16. SAVE OUTPUTS
 # ==========================================================
 
-future_proj.to_csv("future_country_predictions.csv", index=False)
-future_2100.to_csv("future_global_predictions.csv", index=False)
+future_proj.to_csv(DATA_DIR / "future_country_predictions.csv", index=False)
+future_2100.to_csv(DATA_DIR / "future_global_predictions.csv", index=False)
 
 print("Saved output files.")
