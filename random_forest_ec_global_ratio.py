@@ -29,8 +29,8 @@ from ai_energy import get_ai_energy_for_years, get_ai_energy_uncertainty_for_yea
 # ---------------------------------------------------------------------------
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-EC_MODEL_PATH = DATA_DIR / "ec_model.joblib"
-PLOTS_DIR = DATA_DIR / "plots"
+EC_MODEL_PATH = Path(__file__).resolve().parent / "ec_model.joblib"
+PLOTS_DIR = Path(__file__).resolve().parent / "plots"
 OUTPUT_DATA_DIR = DATA_DIR # CSVs for training/test inputs, features, and ratios
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DATA_DIR.mkdir(parents=True, exist_ok=True)

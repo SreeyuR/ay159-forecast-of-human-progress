@@ -27,8 +27,8 @@ url_final = "https://raw.githubusercontent.com/AntongZ1/Data/main/finaldata0411.
 finaldata = pd.read_csv(url_final)
 
 # GDP and Population for ALL years from local ARIMA files only
-gdp_arima = pd.read_csv("data/ARIMA input data - GDP.csv")
-pop_arima = pd.read_csv("data/ARIMA input data - Population.csv")
+gdp_arima = pd.read_csv(f"{DATA_DIR}/ARIMA input data - GDP.csv")
+pop_arima = pd.read_csv(f"{DATA_DIR}/ARIMA input data - Population.csv")
 
 # ==========================================================
 # 3. FEATURES
