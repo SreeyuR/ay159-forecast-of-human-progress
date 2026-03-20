@@ -399,21 +399,7 @@ def main():
         color=pred_color,
         alpha=0.3,
     )
-    plt.fill_between(
-        years_ai,
-        ratio_ai_lower,
-        ratio_ai_upper,
-        color="tab:purple",
-        alpha=0.3,
-    )
-    plt.plot(
-        years_ai,
-        ratio_ai_plot,
-        color="tab:purple",
-        linewidth=2,
-        linestyle="--",
-        label="Predictions + AI energy (2027–2100)",
-    )
+    # Removed plotting of the AI-augmented predictions to omit the purple line and band.
     plt.xlabel("Year")
     plt.ylabel("Ratio (EC_42 / Global EC)")
     plt.title("Random Forest EC_42/Global_EC Predictions (per-country model, summed)")

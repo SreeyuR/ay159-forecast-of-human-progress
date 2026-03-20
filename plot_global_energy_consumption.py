@@ -8,11 +8,13 @@ Forecast (2020-2100): A/B, scaled so that 2020 equals the historical value (line
 Forecast + AI energy (2027-2100): Global EC + AI energy from get_ai_energy_for_years (red dashed).
 """
 
+import math
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as fm
 from pathlib import Path
 
 from ai_energy import get_ai_energy_for_years, get_ai_energy_uncertainty_for_years
@@ -39,7 +41,89 @@ def _kardashev_k(y_ej):
     power_watts = y * 1e18 / (365 * 24 * 60 * 60)
     return (np.log10(power_watts) - 6) / 10
 
-print(_kardashev_k(500))
+
+def _format_k_growth_mpl(g: float) -> str:
+    """Format relative K growth over 5 years as mathtext, e.g. $3.28\\times 10^{-3}$."""
+    if g == 0 or not np.isfinite(g):
+        return "0"
+    exp = int(math.floor(math.log10(abs(g))))
+    mant = g / (10**exp)
+    return rf"${mant:.2f}\times 10^{{{exp}}}$"
+
+
+def save_forecast_results_table_png(forecast_df: pd.DataFrame, out_path: Path) -> None:
+    """
+    Table 1 style: 5-year rows 2025–2100; energy (EJ), K, and relative K growth over the
+    prior 5 years: (K_t - K_{t-5}) / K_{t-5} (for 2025, K_2020 from the same forecast series).
+    """
+    years = np.arange(2025, FORECAST_YEAR_MAX + 1, 5, dtype=int)
+    fc = forecast_df.set_index("Year")["Global_EC_EJ"]
+    missing = [y for y in years if y not in fc.index]
+    if missing:
+        raise ValueError(f"Forecast missing years required for table: {missing[:5]}...")
+
+    header0 = ["", "Projected values", "", ""]
+    header1 = ["Year", "Energy consumption (EJ)", "K", ""]
+    header2 = ["", "", "Value", "Growth rate (past 5 years)"]
+
+    rows = []
+    for y in years:
+        ec = float(fc.loc[y])
+        k = float(_kardashev_k(ec))
+        y0 = y - 5
+        k_prev = float(_kardashev_k(float(fc.loc[y0])))
+        growth = (k - k_prev) / k_prev if k_prev != 0 else float("nan")
+        rows.append(
+            [
+                str(int(y)),
+                f"{ec:.2f}",
+                f"{k:.5f}",
+                _format_k_growth_mpl(growth),
+            ]
+        )
+
+    cell_text = [header0, header1, header2] + rows
+    nrows = len(cell_text)
+
+    fig_h = max(8.0, 0.35 * nrows + 2.0)
+    fig, ax = plt.subplots(figsize=(11, fig_h))
+    ax.axis("off")
+
+    serif = "Times New Roman"
+    if serif not in {f.name for f in fm.fontManager.ttflist}:
+        serif = "DejaVu Serif"
+
+    table = ax.table(
+        cellText=cell_text,
+        loc="center",
+        cellLoc="center",
+        edges="closed",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.15, 1.8)
+
+    header_gray = "#d9d9d9"
+    for (r, c), cell in table.get_celld().items():
+        cell.set_text_props(family=serif)
+        cell.set_edgecolor("#333333")
+        cell.set_linewidth(0.6)
+        if r < 3:
+            cell.set_facecolor(header_gray)
+            cell.get_text().set_weight("bold")
+        else:
+            cell.set_facecolor("white")
+            cell.get_text().set_weight("normal")
+
+    cap = (
+        "Table 1. Final forecasting results. The predicted values for energy consumption, "
+        "civilization development index K, as well as its growth rate over each 5-year period."
+    )
+    fig.text(0.5, 0.02, cap, ha="center", va="bottom", fontsize=9, family=serif)
+    plt.subplots_adjust(bottom=0.12, top=0.98)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
 
 def load_historical_global_ec() -> pd.DataFrame:
     """Load historical global EC (EJ) for 1970-2020 from ARIMA input data."""
@@ -135,6 +219,34 @@ def main():
     forecast_plus_ai_2027_lower = forecast_plus_ai_2027["Global_EC_EJ"].values + ai_lower[idx_2027]
     forecast_plus_ai_2027_upper = forecast_plus_ai_2027["Global_EC_EJ"].values + ai_upper[idx_2027]
 
+    # Print values at 2100 for reference
+    year_2100_mask = forecast_ab["Year"] == 2100
+    if year_2100_mask.any():
+        ec_2100 = float(forecast_ab.loc[year_2100_mask, "Global_EC_EJ"].iloc[0])
+        delta_2100 = float(forecast_ab.loc[year_2100_mask, "delta"].iloc[0])
+        k_2100 = float(_kardashev_k(ec_2100))
+        print(f"Forecast 2100 Global EC (no AI): {ec_2100:.3f} EJ/year")
+        print(f"Forecast 2100 uncertainty (no AI): ±{delta_2100:.3f} EJ/year")
+        print(f"Kardashev index K at 2100 (no AI): {k_2100:.4f}")
+
+        # With AI energy included
+        plus_ai_2100_row = forecast_plus_ai.loc[forecast_plus_ai["Year"] == 2100]
+        if not plus_ai_2100_row.empty:
+            ec_plus_ai_2100 = float(plus_ai_2100_row["Global_EC_EJ_plus_AI"].iloc[0])
+            # Find corresponding uncertainty band with AI for 2100
+            mask_2027_2100 = forecast_plus_ai_2027["Year"] == 2100
+            if mask_2027_2100.any():
+                idx = np.where(forecast_plus_ai_2027["Year"].values == 2100)[0][0]
+                lower_2100_ai = float(forecast_plus_ai_2027_lower[idx])
+                upper_2100_ai = float(forecast_plus_ai_2027_upper[idx])
+                delta_2100_ai = (upper_2100_ai - lower_2100_ai) / 2.0
+            else:
+                delta_2100_ai = float("nan")
+            k_plus_ai_2100 = float(_kardashev_k(ec_plus_ai_2100))
+            print(f"Forecast 2100 Global EC + AI: {ec_plus_ai_2100:.3f} EJ/year")
+            print(f"Forecast 2100 uncertainty (+ AI): ±{delta_2100_ai:.3f} EJ/year")
+            print(f"Kardashev index K at 2100 (+ AI): {k_plus_ai_2100:.4f}")
+
     # Plot: Historical (1970-2020) in blue, Forecast (2020-2100), Forecast + AI (2027-2100) red dashed
     plt.figure(figsize=(10, 6))
     plt.plot(
@@ -198,6 +310,10 @@ def main():
     # Optional: save forecast series for reference
     forecast.to_csv(DATA_DIR / "global_energy_consumption_forecast.csv", index=False)
     print("Saved forecast series to data/global_energy_consumption_forecast.csv")
+
+    table_path = PLOTS_DIR / "forecast_final_results_table.png"
+    save_forecast_results_table_png(forecast, table_path)
+    print("Saved table to", table_path)
 
 
 if __name__ == "__main__":
